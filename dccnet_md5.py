@@ -7,21 +7,32 @@ import time
 from collections import deque
 from typing import Optional
 
+# Sync
 SYNC_WORD = 0xDCC023C2 
 SYNC_BYTES = struct.pack("!I", SYNC_WORD) * 2   
 
+# Flags
 MAX_PAYLOAD = 4096       # bytes
 ACK_FLAG = 0x80          # bit 7
 END_FLAG = 0x40          # bit 6
 RST_FLAG = 0x20          # bit 5
 
+# Estrutura do header
+'''
+! = big endian
+I = unsigned int (4 bytes)
+H = usigned short (2 bytes)
+B = unsigned char (1 byte)
+Total do header = 15 bytes
+'''
 HEADER_FMT = "!IIHHHB"   # SYNC, SYNC, chksum, length, id, flags
 HEADER_LEN = struct.calcsize(HEADER_FMT)
 
+# Timeout
 RETRANSMIT_TIMEOUT = 1.0  # segundos
 MAX_RETRIES = 16
 
-
+# Checksum
 def checksum(data: bytes) -> int:
     """
     Internet Checksum (RFC 1071).
@@ -42,30 +53,30 @@ def checksum(data: bytes) -> int:
 # -------------------- Classe Frame -----------------------------
 
 class Frame:
-    __slots__ = ("checksum", "length", "ident", "flags", "payload")
+    __slots__ = ("checksum", "length", "ident", "flags", "payload") # slots pra evitar o Python de fazer dict (otimizar memória)
 
-    def __init__(self, payload: bytes = b"", ident: int = 0, flags: int = 0):
+    def __init__(self, payload: bytes = b"", ident: int = 0, flags: int = 0): # PADRAO: payload vazio, ID=0 e flag indicando que é um ACK
         if len(payload) > MAX_PAYLOAD:
             raise ValueError("Payload must be 4096 bytes maximum.")
         self.payload = payload
         self.length = len(payload)
-        self.ident = ident & 0xFFFF
-        self.flags = flags & 0xFF
-        self.checksum = 0 
+        self.ident = ident & 0xFFFF # faz um AND binário com 0xFFFF (1111111111111111) o que força o valor do ID caber em 16 bits (ou seja, 2 bytes)
+        self.flags = flags & 0xFF # faz um AND binário (11111111) e força a flag a caber em 1 byte
+        self.checksum = 0 # checksum só pode ser calculado depois que o frame inteiro for montade
 
     # ---- serialização ----
-    def to_bytes(self) -> bytes:
-        header_wo_ck = struct.pack(
+    def to_bytes(self) -> bytes: # Converte o objeto Frame em uma sequência de bytes
+        header_no_checksum = struct.pack(  # serializa primeiro o header
             "!IIHHHB",
             SYNC_WORD,
             SYNC_WORD,
-            0,                 # placeholder checksum
+            0,                # placeholder para o checksum
             self.length,
             self.ident,
             self.flags,
         )
-        full = header_wo_ck + self.payload
-        self.checksum = checksum(full)
+        header_complete = header_no_checksum + self.payload
+        self.checksum = checksum(header_complete)
         # monta header final com checksum real
         header = struct.pack(
             "!IIHHHB",
@@ -76,18 +87,18 @@ class Frame:
             self.ident,
             self.flags,
         )
-        return header + self.payload
+        return header + self.payload # retorna o frame serializado em bytes
 
     # ---- parse ----
     @staticmethod
-    def parse_from(buffer: bytearray) -> Optional["Frame"]:
+    def parse_from(buffer: bytearray) -> Optional["Frame"]:  # Optional: Se o frame estiver completo retorna um objeto Frame se não, None
         """Tenta extrair um frame completo do buffer **já alinhado** (dois SYNC no início).
         Retorna Frame se conseguir, None se faltar dados ou checksum falhar (neste caso
         descarta primeiro byte e devolve None).
         """
         if len(buffer) < HEADER_LEN:
             return None  # falta header
-        header = buffer[:HEADER_LEN]
+        header = buffer[:HEADER_LEN] # pega os primeiros 15 bytes do frame e decodifica nos campos usando unpack
         (
             sync1,
             sync2,
@@ -96,24 +107,23 @@ class Frame:
             ident,
             flags,
         ) = struct.unpack(HEADER_FMT, header)
-        if sync1 != SYNC_WORD or sync2 != SYNC_WORD:
+        if sync1 != SYNC_WORD or sync2 != SYNC_WORD: # verifica a sincronização
             # desalinhado – descarta 1 byte
             buffer.pop(0)
-            return None
-        total_len = HEADER_LEN + length
-        if len(buffer) < total_len:
-            return None  # falta payload
-        payload = bytes(buffer[HEADER_LEN:total_len])
+            return None 
+        total_len = HEADER_LEN + length 
+        if len(buffer) < total_len: # verifica se falta algo
+            return None  
+        payload = bytes(buffer[HEADER_LEN:total_len]) # extrai apenas o payload
         # valida checksum
-        buffer_ck = bytearray(header)
-        buffer_ck[8:10] = b"\x00\x00"  # zera campo checksum
-        if checksum(buffer_ck + payload) != chksum:
+        buffer_checksum = bytearray(header) # cria cópia do header
+        buffer_checksum[8:10] = b"\x00\x00"  # zera campo checksum
+        if checksum(buffer_checksum + payload) != chksum:
             # checksum errado – descarta primeiro byte pra tentar realinhar
             buffer.pop(0)
             return None
-        # remove bytes do buffer
-        del buffer[:total_len]
-        frame = Frame(payload, ident, flags)
+        del buffer[:total_len] # remove bytes do buffer
+        frame = Frame(payload, ident, flags) # forma o objeto Frame
         frame.checksum = chksum
         return frame
 

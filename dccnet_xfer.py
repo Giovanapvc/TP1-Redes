@@ -1,49 +1,52 @@
-# dccnet_xfer.py – Grading Application 2 (transferência de arquivos bidirecional)
+# dccnet_xfer.py – Grading Application 2 
 # -----------------------------------------------------------------------------
-# Server (passivo):
+# Server:
 #   python dccnet_xfer.py -s <PORT> <INPUT> <OUTPUT>
-# Cliente (ativo):
+# Client:
 #   python dccnet_xfer.py -c <IP>:<PORT> <INPUT> <OUTPUT>
 # -----------------------------------------------------------------------------
-# Requisitos atendidos:
-# • Usa a mesma implementação de DCCNET (classe DccnetLink) já testada no MD5.
-# • Envia o arquivo <INPUT> para o outro lado, fragmentando em frames de até 4096 B.
-# • Simultaneamente grava tudo que chegar do outro lado em <OUTPUT>.
-# • Quando ambos os lados terminam de enviar (flag END) e receber, fecha a conexão.
-# -----------------------------------------------------------------------------
 
-import argparse
-import os
+USAGE = """
+Uso:
+  # Server mode (passive):
+  python dccnet_xfer.py -s <PORTA> <INPUT> <OUTPUT>
+
+  # Client mode (active):
+  python dccnet_xfer.py -c <IP:PORTA> <INPUT> <OUTPUT>
+"""
+
+import sys
 import socket
 import threading
 from pathlib import Path
 
-from dccnet_md5 import DccnetLink  # reaproveitamos a classe já validada
+from dccnet_md5 import DccnetLink 
 
-CHUNK = 4096  # mesmo limite do payload DCCNET
+CHUNK = 4096 
 
-def send_file(link: DccnetLink, infile: Path):
-    """Lê <infile> e envia via link, terminando com frame END."""
+# Envia arquivo via link e fecha com END
+def sendFile(link: DccnetLink, infile: Path):
     with infile.open("rb") as f:
         while True:
             data = f.read(CHUNK)
             if not data:
                 break
             link.send(data)
-    # sinaliza fim do envio
+
     link.send(b"", end=True)
 
-def recv_file(link: DccnetLink, outfile: Path):
-    """Recebe bytes do link e grava em <outfile> até peer mandar END."""
+# Grava tudo que chegar no link até END
+def receiveFile(link: DccnetLink, outfile: Path):
     with outfile.open("wb") as f:
         while True:
-            data = link.recv(timeout=0.1)
+            data = link.receive(timeout=0.1)
             if data:
                 f.write(data)
-            if link.peer_no_more_data:
+            if link._receivedEndFlag:
                 break
 
-def run_client(addr: str, infile: Path, outfile: Path):
+# Starta Client: abre TCP e começa a transferência
+def runClient(addr: str, infile: Path, outfile: Path):
     host, port_str = addr.rsplit(":", 1)
     port = int(port_str)
     infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
@@ -51,52 +54,59 @@ def run_client(addr: str, infile: Path, outfile: Path):
     sock = socket.socket(family, socktype, proto)
     sock.connect(sockaddr)
     link = DccnetLink(sock)
-    _run_transfer(link, infile, outfile)
+    runTransfer(link, infile, outfile)
 
-def run_server(port: int, infile: Path, outfile: Path):
-    # IPv6 server que escuta em todas as interfaces (IPv4-mapped também funciona)
+# Starta Server: aceita 1 conexão e começa a transferência
+def runServer(port: int, infile: Path, outfile: Path):
     srv = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("::", port))
     srv.listen(1)
-    print(f"[dccnet-xfer] Aguardando conexão em :{port} ...")
+    print(f"[dccnet-xfer - SERVER] Waiting for connection in :{port} ...")
     conn, addr = srv.accept()
-    print(f"[dccnet-xfer] Conexão de {addr}")
+    print(f"[dccnet-xfer - SERVER] Connection established with {addr}")
     link = DccnetLink(conn)
-    _run_transfer(link, infile, outfile)
+    runTransfer(link, infile, outfile)
 
-def _run_transfer(link: DccnetLink, infile: Path, outfile: Path):
-    tx_done = threading.Event()
-    rx_done = threading.Event()
+# Roda threads de envio e recepção, espera ambas, fecha link
+def runTransfer(link: DccnetLink, infile: Path, outfile: Path) -> None:
+    sendDone = threading.Event()
+    receiveDone = threading.Event()
 
-    def tx():
-        send_file(link, infile)
-        tx_done.set()
+    def transmition():
+        sendFile(link, infile)
+        sendDone.set()
 
-    def rx():
-        recv_file(link, outfile)
-        rx_done.set()
+    def reception():
+        receiveFile(link, outfile)
+        receiveDone.set()
 
-    threading.Thread(target=tx, daemon=True).start()
-    threading.Thread(target=rx, daemon=True).start()
+    threading.Thread(target=transmition, daemon=True).start()
+    threading.Thread(target=reception, daemon=True).start()
 
-    # espera ambos terminarem
-    tx_done.wait()
-    rx_done.wait()
+    sendDone.wait()
+    receiveDone.wait()
     link.close()
-    print("[dccnet-xfer] Transferência concluída. Saindo…")
+    print("[dccnet-xfer] Transfer completed. Ending…")
 
+# Parser da linha de comando
+def parseArgs(argv):
+    if len(argv) != 5:
+        sys.exit(USAGE)
+
+    mode, endpoint, in_file, out_file = argv[1:]
+    if mode == "-s":
+        port = int(endpoint)
+        return ("server", port, Path(in_file), Path(out_file))
+    elif mode == "-c":
+        return ("client", endpoint, Path(in_file), Path(out_file))
+    else:
+        sys.exit(USAGE)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DCCNET bidirectional file transfer")
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("-s", metavar="PORT", type=int, help="Servidor passivo – porta para escutar")
-    mode.add_argument("-c", metavar="IP:PORT", help="Cliente ativo – endereço e porta do servidor")
-    parser.add_argument("INPUT", type=Path, help="Arquivo a enviar")
-    parser.add_argument("OUTPUT", type=Path, help="Arquivo onde salvará o que receber")
-    args = parser.parse_args()
+    role, addr, in_path, out_path = parseArgs(sys.argv)
 
-    if args.s is not None:
-        run_server(args.s, args.INPUT, args.OUTPUT)
+    if role == "server":
+        runServer(addr, in_path, out_path)
     else:
-        run_client(args.c, args.INPUT, args.OUTPUT)
+        runClient(addr, in_path, out_path)
